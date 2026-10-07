@@ -116,7 +116,7 @@ class QuitHotkeyFilter(QAbstractNativeEventFilter):
                 self.toolbar.request_quit()
                 return True, 0
             if native_message.wParam == 2:
-                self.toolbar.activate_drawing_mode()
+                self.toolbar.toggle_drawing()
                 return True, 0
         return False, 0
 
@@ -137,7 +137,7 @@ class DrawingOverlay(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self.tool = "pen"
+        self.tool: str | None = "pen"
         self.color = QColor(255, 230, 0, 115)
         self.width = 24
         self.strokes: list[Stroke] = []
@@ -153,8 +153,11 @@ class DrawingOverlay(QWidget):
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)
         self.show()
 
-    def set_tool(self, tool: str) -> None:
+    def set_tool(self, tool: str | None) -> None:
         self.tool = tool
+        self.current_stroke = None
+        if self.passthrough != (tool is None):
+            self.set_passthrough(tool is None)
 
     def set_color(self, color: QColor) -> None:
         if self.tool == "pen":
@@ -174,7 +177,11 @@ class DrawingOverlay(QWidget):
         self.update()
 
     def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.MouseButton.LeftButton or self.passthrough:
+        if (
+            event.button() != Qt.MouseButton.LeftButton
+            or self.passthrough
+            or self.tool is None
+        ):
             return
         if self.toolbar and self.toolbar.frameGeometry().contains(
             event.globalPosition().toPoint()
@@ -242,7 +249,6 @@ class WhiteboardCanvas(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setFixedSize(1600, 900)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.color = QColor("#20252b")
@@ -265,6 +271,17 @@ class WhiteboardCanvas(QWidget):
         self._resize_font_size = 0
         self.tool_cursor = Qt.CursorShape.CrossCursor
         self.setCursor(self.tool_cursor)
+        self.changed.connect(self.fit_contents)
+
+    def fit_contents(self) -> None:
+        # 캔버스는 창 크기를 따라가되, 그림이 창 밖으로 나가면 스크롤할 수 있게 최소 크기를 넓힌다.
+        bounds = QRectF()
+        for stroke in self.strokes:
+            bounds = bounds.united(self.stroke_bounds(stroke))
+        margin = SELECTION_PADDING * 2
+        self.setMinimumSize(
+            max(0, int(bounds.right() + margin)), max(0, int(bounds.bottom() + margin))
+        )
 
     def set_tool(self, tool: str) -> None:
         self.finish_text_edit()
@@ -811,7 +828,8 @@ class WhiteboardWindow(QWidget):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("ScreenMarker 화이트보드")
-        self.resize(1400, 900)
+        screen = parent.screen() or QApplication.primaryScreen()
+        self.resize(screen.availableGeometry().size())
         self.canvas = WhiteboardCanvas()
         self.file_path: str | None = None
         self.dirty = False
@@ -891,7 +909,8 @@ class WhiteboardWindow(QWidget):
 
         scroll_area = QScrollArea()
         scroll_area.setWidget(self.canvas)
-        scroll_area.setWidgetResizable(False)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
 
         outer_layout = QVBoxLayout(self)
         outer_layout.addLayout(layout)
@@ -1025,6 +1044,7 @@ class WhiteboardWindow(QWidget):
         self.canvas.selected_stroke = None
         self.canvas._dragging_stroke = None
         self.canvas._drag_position = None
+        self.canvas.fit_contents()
         self.canvas.update()
         self.file_path = path
         self.dirty = False
@@ -1064,6 +1084,7 @@ class WhiteboardWindow(QWidget):
             self.canvas.strokes = self.copy_strokes(self.saved_strokes)
             self.canvas.current_stroke = None
             self.canvas.selected_stroke = None
+            self.canvas.fit_contents()
             self.canvas.update()
             self.dirty = False
             self.update_title()
@@ -1154,11 +1175,14 @@ class ToolBar(QWidget):
         layout.addWidget(self.drag_handle)
 
         self.tool_buttons: dict[str, QPushButton] = {}
+        self.last_tool = "pen"
         for tool, label in (("pen", "형광펜"), ("rect", "□ 사각형"), ("ellipse", "○ 원")):
             button = QPushButton(label)
             button.setCheckable(True)
             if tool in ("rect", "ellipse"):
-                button.setToolTip("누르고 드래그하여 크기 설정")
+                button.setToolTip("켜고 누른 채 드래그하여 그리기, 다시 누르면 끄고 아래 창 조작")
+            else:
+                button.setToolTip("켜면 그리기, 다시 누르면 끄고 아래 창 조작")
             button.clicked.connect(lambda checked=False, selected=tool: self.select_tool(selected))
             layout.addWidget(button)
             self.tool_buttons[tool] = button
@@ -1212,11 +1236,6 @@ class ToolBar(QWidget):
         whiteboard_button = QPushButton("화이트보드")
         whiteboard_button.clicked.connect(self.open_whiteboard)
         layout.addWidget(whiteboard_button)
-
-        self.mode_button = QPushButton("입력 통과")
-        self.mode_button.setToolTip("Ctrl+Alt+W: 그리기/입력 통과 전환")
-        self.mode_button.clicked.connect(self.toggle_mode)
-        layout.addWidget(self.mode_button)
 
         close_button = QPushButton("닫기")
         close_button.setToolTip("Ctrl+Alt+Q: 종료")
@@ -1307,10 +1326,19 @@ class ToolBar(QWidget):
         QApplication.quit()
 
     def select_tool(self, tool: str) -> None:
+        if self.overlay.tool == tool:
+            self.set_active_tool(None)
+        else:
+            self.set_active_tool(tool)
+
+    def set_active_tool(self, tool: str | None) -> None:
+        if tool is not None:
+            self.last_tool = tool
         self.overlay.set_tool(tool)
         for name, button in self.tool_buttons.items():
             button.setChecked(name == tool)
         self.update_color_button()
+        self.keep_on_top()
 
     def choose_color(self) -> None:
         selected = QColorDialog.getColor(self.overlay.color, self, "그리기 색상 선택")
@@ -1335,15 +1363,8 @@ class ToolBar(QWidget):
     def set_width(self, width: int) -> None:
         self.overlay.width = width
 
-    def toggle_mode(self) -> None:
-        self.overlay.set_passthrough(not self.overlay.passthrough)
-        self.mode_button.setText("그리기 모드" if self.overlay.passthrough else "입력 통과")
-        self.keep_on_top()
-
-    def activate_drawing_mode(self) -> None:
-        self.overlay.set_passthrough(False)
-        self.mode_button.setText("입력 통과")
-        self.keep_on_top()
+    def toggle_drawing(self) -> None:
+        self.set_active_tool(self.last_tool if self.overlay.tool is None else None)
 
 
 def main() -> int:
