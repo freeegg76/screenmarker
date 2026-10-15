@@ -123,6 +123,7 @@ class QuitHotkeyFilter(QAbstractNativeEventFilter):
 
 class DrawingOverlay(QWidget):
     drawing_started = Signal()
+    cancel_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -187,6 +188,9 @@ class DrawingOverlay(QWidget):
             event.globalPosition().toPoint()
         ):
             return
+        # Esc 키를 받을 수 있도록 그리기 시작 시 오버레이에 키보드 포커스를 준다.
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         point = event.position()
         stroke_color = QColor(self.color)
         if self.tool == "pen":
@@ -212,6 +216,13 @@ class DrawingOverlay(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.current_stroke = None
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancel_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -1251,6 +1262,7 @@ class ToolBar(QWidget):
         self.overlay.drawing_started.connect(
             self.keep_on_top, Qt.ConnectionType.QueuedConnection
         )
+        self.overlay.cancel_requested.connect(self.cancel_drawing)
 
     def position_on_screen(self) -> None:
         screen = QApplication.primaryScreen().availableGeometry()
@@ -1362,6 +1374,17 @@ class ToolBar(QWidget):
 
     def set_width(self, width: int) -> None:
         self.overlay.width = width
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancel_drawing()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def cancel_drawing(self) -> None:
+        self.overlay.clear()
+        self.set_active_tool(None)
 
     def toggle_drawing(self) -> None:
         self.set_active_tool(self.last_tool if self.overlay.tool is None else None)
